@@ -112,7 +112,7 @@ CONFIG = {
     "ema_dist_in":       _env("EMA_DIST_IN",   1.2),
     "body_ratio_in":     _env("BODY_IN",       0.50),
     "streak_in":         _env("STREAK_IN",     4),
-    "min_votes":         _env("MIN_VOTES",     3),
+    "min_votes":         _env("MIN_VOTES",     4),  # raised from 3
     "min_ticks":         _env("MIN_TICKS",     120),
 
     # ── Risk / Martingale ──────────────────────────────────────
@@ -121,6 +121,10 @@ CONFIG = {
     "max_losses":       _env("MAX_LOSSES",       5),
     "target_profit":    _env("TARGET_PROFIT",    5.0),
     "stop_loss":        _env("STOP_LOSS",       15.0),
+
+    # ── Consecutive loss circuit breaker ──────────────────
+    "consec_loss_limit": _env("CONSEC_LOSS_LIMIT",   3),   # pause after N straight losses
+    "consec_pause_secs": _env("CONSEC_PAUSE_SECS", 600),   # pause duration in seconds (10 min)
 
     # ── Resilience ─────────────────────────────────────────────
     "lock_timeout":         _env("LOCK_TIMEOUT",      130),  # 2 min + buffer
@@ -695,6 +699,9 @@ class ExpiryRangeBot:
 
         self._stop = False
 
+        # ── Circuit breaker state ────────────────────────────
+        self._cb_paused_until: float = 0.0   # epoch time when pause ends
+
     # ── Lock helpers ─────────────────────────────────────────────────────────
 
     def _unlock(self, reason: str = "manual"):
@@ -725,8 +732,12 @@ class ExpiryRangeBot:
                     self._unlock("user command")
                 elif cmd == "s":
                     self.risk._print_stats()
+                    now = time.monotonic()
+                    cb_info = ""
+                    if now < self._cb_paused_until:
+                        cb_info = f"  BREAKER paused {self._cb_paused_until - now:.0f}s"
                     print(f"  >> Ticks: {self.tick_count}  "
-                          f"Ready: {self.signal.is_ready()}")
+                          f"Ready: {self.signal.is_ready()}{cb_info}")
                 elif cmd in ("q", "quit", "exit"):
                     _log("CMD", "Quit")
                     self._stop = True
@@ -783,6 +794,14 @@ class ExpiryRangeBot:
 
         if result["decision"] is None:
             return
+
+        # Circuit breaker check
+        now = time.monotonic()
+        if now < self._cb_paused_until:
+            remaining = self._cb_paused_until - now
+            _log("BREAKER", f"Paused — {remaining:.0f}s remaining after loss streak")
+            return
+
         if not self.risk.can_trade():
             return
 
@@ -835,6 +854,14 @@ class ExpiryRangeBot:
             self.risk.record_win(profit)
         else:
             self.risk.record_loss(profit)
+            # Check circuit breaker
+            limit = self.cfg["consec_loss_limit"]
+            pause = self.cfg["consec_pause_secs"]
+            if self.risk.loss_streak > 0 and self.risk.loss_streak % limit == 0:
+                self._cb_paused_until = time.monotonic() + pause
+                _log("BREAKER",
+                     f"🛑 {limit} consecutive losses — pausing {pause}s "
+                     f"({pause//60}m {pause%60}s)")
 
         self._unlock("settlement")
         return self.risk.can_trade()
@@ -886,8 +913,9 @@ class ExpiryRangeBot:
               f"(x{cfg['martingale_mul']} mart, reset @{cfg['max_losses']} losses)")
         print(f"  Target   : +${cfg['target_profit']}  "
               f"Stop: -${cfg['stop_loss']}")
-        print(f"  Min votes: {cfg['min_votes']}/6 layers")
+        print(f"  Min votes: {cfg['min_votes']}/6 layers  (min 4 required)")
         print(f"  Warmup   : {cfg['min_ticks']} ticks")
+        print(f"  CB Limit : {cfg['consec_loss_limit']} losses → {cfg['consec_pause_secs']}s pause ({cfg['consec_pause_secs']//60}m)")
         print("="*58)
         print("  Signal layers:")
         print("    0  ATR regime       (LOW vol → trade)")
